@@ -83,6 +83,16 @@ def _render_storage_usage(nb: Notebook) -> None:
 # ---------- Source ingestion ----------
 
 def _render_local_pdf_uploader(nb: Notebook) -> None:
+    # Surface any failures from the previous upload attempt (status box vanishes on rerun).
+    fail_key = f"upload_failures_{nb.id}"
+    failures = st.session_state.get(fail_key)
+    if failures:
+        for filename, error in failures:
+            st.error(f"**{filename}** — {error}")
+        if st.button("Dismiss errors", key=f"dismiss_{nb.id}"):
+            del st.session_state[fail_key]
+            st.rerun()
+
     uploaded = st.file_uploader(
         "Upload PDFs",
         type=["pdf"],
@@ -92,22 +102,37 @@ def _render_local_pdf_uploader(nb: Notebook) -> None:
     )
     if uploaded and st.button("Add to notebook", key=f"pdf_add_{nb.id}", use_container_width=True, type="primary"):
         files = [(f.name, f.read()) for f in uploaded]
+        any_success = False
+        failures: list[tuple[str, str]] = []
         with st.status(f"Indexing {len(files)} PDF(s)...", expanded=True) as status:
+            status.write("Large textbooks can take several minutes. Do not refresh the page.")
             for filename, data in files:
-                status.write(f"Uploading {filename}...")
-                res = pdf_ingest.ingest_pdf(nb.file_search_store_name, data, filename)
-                if res.status == "ready":
-                    status.write(f"✅ {filename} indexed")
-                    notebooks_storage.add_source(nb, Source(
-                        document_name=res.document_name,
-                        display_name=filename,
-                        origin="local",
-                        added_at=time.time(),
-                    ))
-                else:
-                    status.write(f"❌ {filename}: {res.error}")
-            status.update(label="Done", state="complete")
-        st.rerun()
+                size_mb = len(data) / (1024 * 1024)
+                status.write(f"Uploading {filename} ({size_mb:.1f} MB)...")
+                results = pdf_ingest.ingest_pdf(nb.file_search_store_name, data, filename)
+                if len(results) > 1:
+                    status.write(f"  Split into {len(results)} chunks (>{90} MB Gemini per-file cap).")
+                for res in results:
+                    if res.status == "ready":
+                        status.write(f"✅ {res.filename} indexed")
+                        notebooks_storage.add_source(nb, Source(
+                            document_name=res.document_name,
+                            display_name=res.filename,
+                            origin="local",
+                            added_at=time.time(),
+                        ))
+                        any_success = True
+                    else:
+                        status.write(f"❌ {res.filename}: {res.error}")
+                        failures.append((res.filename, res.error or "unknown error"))
+            final_state = "error" if failures else "complete"
+            final_label = f"Failed: {len(failures)} / {len(files)}" if failures else "Done"
+            status.update(label=final_label, state=final_state, expanded=bool(failures))
+        # Persist failures across rerun so the user can actually read them.
+        if failures:
+            st.session_state[f"upload_failures_{nb.id}"] = failures
+        if any_success:
+            st.rerun()
 
 
 def _render_drive_picker(nb: Notebook) -> None:
@@ -177,18 +202,21 @@ def _render_drive_picker(nb: Notebook) -> None:
                     status.write(f"❌ {f.name}: download failed: {e}")
                     continue
                 status.write(f"Indexing {f.name}...")
-                res = pdf_ingest.ingest_pdf(nb.file_search_store_name, data, f.name)
-                if res.status == "ready":
-                    status.write(f"✅ {f.name} indexed")
-                    notebooks_storage.add_source(nb, Source(
-                        document_name=res.document_name,
-                        display_name=f.name,
-                        origin="drive",
-                        added_at=time.time(),
-                        extra={"drive_file_id": f.id},
-                    ))
-                else:
-                    status.write(f"❌ {f.name}: {res.error}")
+                results = pdf_ingest.ingest_pdf(nb.file_search_store_name, data, f.name)
+                if len(results) > 1:
+                    status.write(f"  Split into {len(results)} chunks (>90 MB Gemini per-file cap).")
+                for res in results:
+                    if res.status == "ready":
+                        status.write(f"✅ {res.filename} indexed")
+                        notebooks_storage.add_source(nb, Source(
+                            document_name=res.document_name,
+                            display_name=res.filename,
+                            origin="drive",
+                            added_at=time.time(),
+                            extra={"drive_file_id": f.id},
+                        ))
+                    else:
+                        status.write(f"❌ {res.filename}: {res.error}")
             status.update(label="Done", state="complete")
         st.rerun()
 
@@ -270,6 +298,13 @@ def _render_mode_toggles() -> None:
 # ---------- Public entry ----------
 
 def render_sidebar() -> Notebook | None:
+    # Consume any pending mode switch BEFORE the agent_mode radio widget is
+    # instantiated below — Streamlit forbids writing to a session_state key
+    # after its widget has rendered in the same run.
+    pending = st.session_state.pop("_mode_switch_pending", None)
+    if pending:
+        st.session_state.agent_mode = pending
+
     with st.sidebar:
         nb = _render_notebook_picker()
 

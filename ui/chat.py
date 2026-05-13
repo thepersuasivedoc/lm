@@ -11,14 +11,13 @@ import streamlit as st
 from agents import expert as expert_agent
 from agents import storyteller as storyteller_agent
 from config import HANDOFF_CONTEXT_TURNS
+from hermes.memory import SessionDB
 from storage import notebooks as notebooks_storage
 from storage.notebooks import Message, Notebook
 
 
 TOOL_LABELS = {
     "pubmed_search": "\U0001f9ec Querying PubMed",
-    "web_search": "\U0001f310 Searching the web",
-    "google_search": "\U0001f310 Searching the web",
     "file_search": "\U0001f50e Searching uploaded sources",
 }
 
@@ -33,12 +32,25 @@ def _ensure_session_state() -> None:
     st.session_state.setdefault("handoff_packet", None)
 
 
+@st.cache_resource
+def _get_db() -> SessionDB:
+    return SessionDB()
+
+
+def _get_session_id(nb: Notebook, pane: str, first_message: str) -> str:
+    """Lazily start a Hermes session for this (notebook, pane). Per-process scope."""
+    key = f"hermes_sid_{nb.id}_{pane}"
+    sid = st.session_state.get(key)
+    if sid:
+        return sid
+    db = _get_db()
+    sid = db.start_session(nb.id, pane=pane, title=first_message[:60].strip() or None)
+    st.session_state[key] = sid
+    return sid
+
+
 def _render_citation(c: dict) -> str:
     t = c.get("type", "")
-    if t == "web":
-        title = c.get("title", c.get("uri", "web"))
-        uri = c.get("uri", "")
-        return f"\U0001f310 [{title}]({uri})" if uri else f"\U0001f310 {title}"
     if t == "file_search":
         title = c.get("title", "source")
         return f"\U0001f4d8 {title}"
@@ -136,6 +148,11 @@ def _handle_expert_turn(nb: Notebook, user_input: str) -> None:
     notebooks_storage.append_message(nb, "expert", assistant_msg)
     st.session_state.expert_messages = nb.expert_chat[:]
 
+    db = _get_db()
+    sid = _get_session_id(nb, "expert", user_input)
+    db.append_turn(sid, "user", user_input)
+    db.append_turn(sid, "expert", text)
+
 
 def _handle_storyteller_turn(nb: Notebook, user_input: str) -> None:
     # Build/refresh handoff packet on every turn so the cache stays valid as the
@@ -162,6 +179,11 @@ def _handle_storyteller_turn(nb: Notebook, user_input: str) -> None:
     assistant_msg = Message(role="storyteller", content=text, ts=time.time(), citations=citations)
     notebooks_storage.append_message(nb, "storyteller", assistant_msg)
 
+    db = _get_db()
+    sid = _get_session_id(nb, "storyteller", user_input)
+    db.append_turn(sid, "user", user_input)
+    db.append_turn(sid, "storyteller", text)
+
 
 def _render_handoff_button(nb: Notebook) -> None:
     if st.session_state.agent_mode != "expert":
@@ -169,7 +191,11 @@ def _render_handoff_button(nb: Notebook) -> None:
     if not nb.expert_chat:
         return
     if st.button("\U0001f3ac Send to Storyteller", help="Switch to the storyteller agent and seed it with this conversation"):
-        st.session_state.agent_mode = "storyteller"
+        # Defer the mode switch: the radio widget in the sidebar has already
+        # instantiated st.session_state.agent_mode this run, so we can't write
+        # to it directly. Sentinel is consumed at the top of render_sidebar
+        # on the next run, before the widget is rebuilt.
+        st.session_state._mode_switch_pending = "storyteller"
         st.toast("Switched to Storyteller. Tell it what kind of script you want.", icon="\U0001f3ac")
         st.rerun()
 

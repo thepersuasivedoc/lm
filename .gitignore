@@ -1,4 +1,5 @@
 .env
+*.env
 notebooks/
 __pycache__/
 *.pyc
@@ -6,3 +7,4 @@ __pycache__/
 venv/
 .streamlit/secrets.toml
 .DS_Store
+.claude/

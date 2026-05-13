@@ -9,11 +9,7 @@ from google import genai
 from google.genai import types
 
 from config import EXPERT_MODEL
-from agents.tools import (
-    dispatch_gemini_function_call,
-    gemini_google_search_tool,
-    gemini_pubmed_tool,
-)
+from agents.tools import dispatch_gemini_function_call, gemini_pubmed_tool
 from storage import file_search
 
 
@@ -37,20 +33,23 @@ ABSOLUTE RULES:
 """
 
 SYSTEM_STRICT = """\
-ACCESS MODE: STRICT.
-You have ONLY file_search available. If a topic isn't covered by the uploaded sources, \
-say: "This isn't covered in your current sources. Upload more or switch to extended mode \
-to consult PubMed/web." Do NOT draw on outside medical knowledge.
+ACCESS MODE: STRICT (uploaded-sources only).
+You have ONLY file_search available. The user's uploaded textbooks and lecture \
+transcripts are your single source of truth. If a topic isn't covered, say: \
+"This isn't covered in your current sources. Upload more, or switch to extended \
+mode to consult PubMed." Do NOT draw on outside medical knowledge.
 """
 
 SYSTEM_EXTENDED = """\
-ACCESS MODE: EXTENDED.
-Tool priority:
-1. ALWAYS try the user's uploaded sources first (file_search runs implicitly on every turn).
-2. If the uploaded sources don't cover the topic, call pubmed_search for peer-reviewed \
-clinical evidence, or use google_search for general / anatomical / definitional gaps.
-3. State explicitly which source produced each part of the answer.
-4. Prefer uploaded sources + PubMed over arbitrary web pages.
+ACCESS MODE: EXTENDED (PubMed only).
+You do NOT have access to the user's uploaded sources in this mode — that is a \
+Gemini API restriction (built-in file_search and function-calling pubmed_search \
+cannot coexist in one request). Use pubmed_search for peer-reviewed clinical \
+evidence. If a question is really about the user's uploaded textbook or lecture \
+content, tell them to switch back to strict mode.
+
+For claims that PubMed doesn't cover, say so explicitly with [VERIFY: <claim>] \
+rather than relying on general knowledge.
 """
 
 TEACH_PROMPTS = {
@@ -84,11 +83,12 @@ def _client() -> genai.Client:
 
 
 def _build_tools(store_name: str, access_mode: AccessMode) -> list[types.Tool]:
-    tools: list[types.Tool] = [file_search.file_search_tool(store_name)]
+    # Gemini disallows mixing built-in tools (file_search) with custom function
+    # declarations (pubmed_search) in one request, so the modes are exclusive:
+    # strict uses file_search, extended uses pubmed_search.
     if access_mode == "extended":
-        tools.append(gemini_google_search_tool())
-        tools.append(gemini_pubmed_tool())
-    return tools
+        return [gemini_pubmed_tool()]
+    return [file_search.file_search_tool(store_name)]
 
 
 def _messages_to_contents(messages: Iterable[dict]) -> list[types.Content]:
@@ -137,7 +137,6 @@ def chat_with_expert(
         function_calls: list[types.FunctionCall] = []
         assistant_parts: list[types.Part] = []
         grounding_metadata = None
-        produced_text = False
 
         for chunk in stream:
             if not chunk.candidates:
@@ -146,7 +145,6 @@ def chat_with_expert(
             if cand.content and cand.content.parts:
                 for part in cand.content.parts:
                     if getattr(part, "text", None):
-                        produced_text = True
                         assistant_parts.append(types.Part(text=part.text))
                         yield {"type": "text", "content": part.text}
                     fc = getattr(part, "function_call", None)
@@ -187,17 +185,8 @@ def chat_with_expert(
 def _parse_grounding(gm) -> list[dict]:
     """Convert Gemini grounding metadata into a flat citation list for the UI."""
     citations: list[dict] = []
-
-    # Google Search grounding chunks.
     chunks = getattr(gm, "grounding_chunks", []) or []
     for c in chunks:
-        web = getattr(c, "web", None)
-        if web is not None:
-            citations.append({
-                "type": "web",
-                "title": getattr(web, "title", "") or "",
-                "uri": getattr(web, "uri", "") or "",
-            })
         retrieved = getattr(c, "retrieved_context", None)
         if retrieved is not None:
             citations.append({
@@ -206,5 +195,4 @@ def _parse_grounding(gm) -> list[dict]:
                 "uri": getattr(retrieved, "uri", "") or "",
                 "text": getattr(retrieved, "text", "") or "",
             })
-
     return citations

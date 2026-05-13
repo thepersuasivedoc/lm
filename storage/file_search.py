@@ -6,7 +6,6 @@ import io
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 from google import genai
@@ -42,14 +41,51 @@ def delete_store(store_name: str) -> None:
     client.file_search_stores.delete(name=store_name, config={"force": True})
 
 
-def _wait_for_operation(client: genai.Client, operation, timeout_sec: int, poll_sec: int):
+def _find_doc(store_name: str, display_name: str) -> "IndexedFile | None":
+    for doc in list_files(store_name):
+        if doc.display_name == display_name:
+            return doc
+    return None
+
+
+def _poll_until_terminal(
+    client: genai.Client,
+    operation,
+    store_name: str,
+    display_name: str,
+    timeout_sec: int,
+    poll_sec: int,
+) -> str:
+    """Poll Gemini until the doc reaches a terminal state.
+
+    Prefers the document state (faster, more honest) over the operation's done
+    flag — Gemini occasionally lags the operation marker behind the doc's real
+    state, which hangs the synchronous caller. Returns the resource name when
+    the doc reaches STATE_ACTIVE.
+    """
     deadline = time.time() + timeout_sec
-    while not operation.done:
+    while True:
+        doc = _find_doc(store_name, display_name)
+        if doc is not None:
+            state = str(doc.state).upper()
+            if "ACTIVE" in state:
+                return doc.name
+            if "FAILED" in state and getattr(operation, "done", False):
+                err = getattr(operation, "error", None)
+                raise RuntimeError(
+                    f"Gemini indexing failed for {display_name}"
+                    + (f": {err}" if err else "")
+                )
         if time.time() > deadline:
-            raise TimeoutError("File Search indexing did not finish in time.")
+            raise TimeoutError(
+                f"File Search indexing did not finish in time ({timeout_sec}s) for {display_name}."
+            )
         time.sleep(poll_sec)
-        operation = client.operations.get(operation)
-    return operation
+        try:
+            operation = client.operations.get(operation)
+        except Exception:
+            # Operation tracking is best-effort; the doc state is authoritative.
+            pass
 
 
 def upload_pdf(
@@ -59,7 +95,16 @@ def upload_pdf(
     timeout_sec: int = 180,
     poll_sec: int = 2,
 ) -> str:
-    """Upload a PDF to the store, block until indexed, return the document resource name."""
+    """Upload a PDF to the store, block until indexed, return the document resource name.
+
+    Dedup-aware: if an ACTIVE document with the same display_name already exists,
+    skip the upload and return the existing resource. This makes partial-upload
+    retries idempotent.
+    """
+    existing = _find_doc(store_name, display_name)
+    if existing is not None and "ACTIVE" in str(existing.state).upper():
+        return existing.name
+
     client = _client()
     bio = io.BytesIO(pdf_bytes)
     bio.name = display_name if display_name.lower().endswith(".pdf") else f"{display_name}.pdf"
@@ -69,17 +114,7 @@ def upload_pdf(
         file_search_store_name=store_name,
         config={"display_name": display_name, "mime_type": "application/pdf"},
     )
-    operation = _wait_for_operation(client, operation, timeout_sec, poll_sec)
-
-    # The completed operation's response carries the document resource.
-    response = getattr(operation, "response", None)
-    if response is not None and getattr(response, "name", None):
-        return response.name
-    # Fallback: list documents and return the most recently created with this display_name.
-    for doc in list_files(store_name):
-        if doc.display_name == display_name:
-            return doc.name
-    raise RuntimeError(f"Could not resolve document resource for {display_name}")
+    return _poll_until_terminal(client, operation, store_name, display_name, timeout_sec, poll_sec)
 
 
 def upload_text(
@@ -90,6 +125,10 @@ def upload_text(
     poll_sec: int = 2,
 ) -> str:
     """Upload plain text (e.g., a YouTube transcript) as a .txt document."""
+    existing = _find_doc(store_name, display_name)
+    if existing is not None and "ACTIVE" in str(existing.state).upper():
+        return existing.name
+
     client = _client()
     bio = io.BytesIO(text.encode("utf-8"))
     bio.name = display_name if display_name.lower().endswith(".txt") else f"{display_name}.txt"
@@ -99,15 +138,7 @@ def upload_text(
         file_search_store_name=store_name,
         config={"display_name": display_name, "mime_type": "text/plain"},
     )
-    operation = _wait_for_operation(client, operation, timeout_sec, poll_sec)
-
-    response = getattr(operation, "response", None)
-    if response is not None and getattr(response, "name", None):
-        return response.name
-    for doc in list_files(store_name):
-        if doc.display_name == display_name:
-            return doc.name
-    raise RuntimeError(f"Could not resolve document resource for {display_name}")
+    return _poll_until_terminal(client, operation, store_name, display_name, timeout_sec, poll_sec)
 
 
 def list_files(store_name: str) -> list[IndexedFile]:

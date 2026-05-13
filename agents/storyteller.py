@@ -1,18 +1,15 @@
-"""Storyteller agent — Claude Opus 4.7 with web_search + pubmed_search tools."""
+"""Storyteller agent — Gemini 2.5 Pro with the pubmed_search tool."""
 
 from __future__ import annotations
 
 import os
 from typing import Generator, Iterable, Literal
 
-import anthropic
+from google import genai
+from google.genai import types
 
 from config import STORYTELLER_MODEL
-from agents.tools import (
-    CLAUDE_PUBMED_TOOL,
-    CLAUDE_WEB_SEARCH_TOOL,
-    dispatch_claude_tool,
-)
+from agents.tools import dispatch_gemini_function_call, gemini_pubmed_tool
 
 
 ScriptFormat = Literal["youtube_long", "shorts", "podcast"]
@@ -26,13 +23,13 @@ into compelling, accurate script ideas they can actually shoot.
 GROUNDING RULES:
 - The expert chat below is your primary source of truth for what the student knows
   and what claims are accurate. Quote / paraphrase from it freely.
-- For factual claims NOT in the expert chat, use pubmed_search (clinical evidence)
-  or web_search (general / definitional). Cite tool sources inline.
-- Mark anything you couldn't verify with [VERIFY: <claim>].
+- For factual claims NOT in the expert chat, use pubmed_search for peer-reviewed
+  clinical evidence. Cite tool sources inline.
+- If a claim is non-clinical and cannot be verified by the expert chat or PubMed,
+  mark it with [VERIFY: <claim>] rather than inventing a source.
 - Cite format:
   - [Expert chat: <short quote or paraphrase>]
   - [PubMed: PMID <id> — <author> et al., <year>]
-  - [Web: <domain> — <page title>]
 - Never invent drug doses, mechanisms, contraindications, or guidelines.
 
 TONE: authoritative but human. Sound like a smart med student explaining to a
@@ -88,11 +85,11 @@ Conversational, scene-setting tone. Lean into narrative; the listener can't see 
 }
 
 
-def _client() -> anthropic.Anthropic:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+def _client() -> genai.Client:
+    api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to your .env file.")
-    return anthropic.Anthropic(api_key=api_key)
+        raise RuntimeError("GOOGLE_API_KEY is not set. Add it to your .env file.")
+    return genai.Client(api_key=api_key)
 
 
 def build_handoff_packet(
@@ -100,7 +97,7 @@ def build_handoff_packet(
     sources_digest: list[dict],
     user_brief: str,
 ) -> str:
-    """Assemble the static handoff context that gets cached on the system prompt."""
+    """Assemble the handoff context appended to the system instruction."""
     lines: list[str] = []
 
     lines.append("=== USER BRIEF ===")
@@ -134,37 +131,19 @@ def build_handoff_packet(
     return "\n".join(lines)
 
 
-def _system_blocks(format_: ScriptFormat, handoff_packet: str) -> list[dict]:
-    """Build system as a list of cached text blocks.
+def _system_instruction(format_: ScriptFormat, handoff_packet: str) -> str:
+    return "\n\n".join([_BASE_RULES, _FORMAT_PROMPTS[format_], handoff_packet])
 
-    Stable content (base rules + format prompt) goes first, then the handoff
-    packet which is static within a session. The 5-min ephemeral cache makes
-    follow-up requests in the same session ~90% cheaper.
+
+def _messages_to_contents(messages: Iterable[dict]) -> list[types.Content]:
+    """Convert {role, content} entries to Gemini Content objects.
+
+    Roles: 'user' or 'storyteller' (which maps to Gemini's 'model').
     """
-    fmt_prompt = _FORMAT_PROMPTS[format_]
-    return [
-        {
-            "type": "text",
-            "text": _BASE_RULES + "\n\n" + fmt_prompt,
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": handoff_packet,
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
-
-
-def _to_anthropic_messages(messages: Iterable[dict]) -> list[dict]:
-    """Convert {role, content} entries to Anthropic's message shape.
-
-    Roles: 'user' or 'storyteller' (which maps to 'assistant').
-    """
-    out: list[dict] = []
+    out: list[types.Content] = []
     for m in messages:
-        role = "assistant" if m["role"] == "storyteller" else "user"
-        out.append({"role": role, "content": m["content"]})
+        role = "model" if m["role"] == "storyteller" else "user"
+        out.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
     return out
 
 
@@ -184,101 +163,56 @@ def generate_script_ideas(
       {"type": "done"}
     """
     client = _client()
-    system_blocks = _system_blocks(format_, handoff_packet)
-    convo = _to_anthropic_messages(messages)
-
-    tools = [CLAUDE_PUBMED_TOOL, CLAUDE_WEB_SEARCH_TOOL]
+    system_instruction = _system_instruction(format_, handoff_packet)
+    contents = _messages_to_contents(messages)
+    tools = [gemini_pubmed_tool()]
 
     for _ in range(max_tool_rounds):
-        with client.messages.stream(
+        stream = client.models.generate_content_stream(
             model=STORYTELLER_MODEL,
-            max_tokens=16000,
-            system=system_blocks,
-            messages=convo,
-            tools=tools,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_start":
-                    block = event.content_block
-                    if block.type == "tool_use":
-                        yield {
-                            "type": "tool_call",
-                            "name": block.name,
-                            "args": {},
-                        }
-                elif event.type == "content_block_delta":
-                    delta = event.delta
-                    if delta.type == "text_delta":
-                        yield {"type": "text", "content": delta.text}
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=tools,
+            ),
+        )
 
-            final = stream.get_final_message()
+        function_calls: list[types.FunctionCall] = []
+        assistant_parts: list[types.Part] = []
 
-        # Persist the assistant turn (full content list, incl. thinking + tool_use blocks).
-        convo.append({"role": "assistant", "content": final.content})
+        for chunk in stream:
+            if not chunk.candidates:
+                continue
+            cand = chunk.candidates[0]
+            if cand.content and cand.content.parts:
+                for part in cand.content.parts:
+                    if getattr(part, "text", None):
+                        assistant_parts.append(types.Part(text=part.text))
+                        yield {"type": "text", "content": part.text}
+                    fc = getattr(part, "function_call", None)
+                    if fc and fc.name:
+                        function_calls.append(fc)
+                        assistant_parts.append(types.Part(function_call=fc))
+                        args = dict(fc.args) if fc.args else {}
+                        yield {"type": "tool_call", "name": fc.name, "args": args}
 
-        # Find any custom-tool invocations we need to execute client-side.
-        # The web_search tool is server-side and resolves itself within the same response.
-        custom_tool_uses = [
-            b for b in final.content
-            if b.type == "tool_use" and b.name in {"pubmed_search"}
-        ]
+        if assistant_parts:
+            contents.append(types.Content(role="model", parts=assistant_parts))
 
-        if final.stop_reason == "end_turn" and not custom_tool_uses:
-            citations = _extract_citations(final.content)
-            if citations:
-                yield {"type": "citations", "citations": citations}
+        if not function_calls:
             yield {"type": "done"}
             return
 
-        if final.stop_reason == "pause_turn" and not custom_tool_uses:
-            # Server-side tool hit its iteration limit; re-send to continue.
-            # Anthropic resumes automatically when the assistant turn ends with a
-            # server_tool_use block — don't add a "continue" user message.
-            continue
-
-        # Execute custom tools and feed results back.
-        tool_results = []
-        for tool_use in custom_tool_uses:
-            input_ = tool_use.input or {}
-            result = dispatch_claude_tool(tool_use.name, input_)
-            yield {"type": "tool_result", "name": tool_use.name, "result": result}
-            is_error = "error" in result
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tool_use.id,
-                "content": _format_tool_result_content(result),
-                "is_error": is_error,
-            })
-
-        convo.append({"role": "user", "content": tool_results})
+        # Execute each custom function call and feed responses back as a user turn.
+        response_parts: list[types.Part] = []
+        for fc in function_calls:
+            args = dict(fc.args) if fc.args else {}
+            result = dispatch_gemini_function_call(fc.name, args)
+            yield {"type": "tool_result", "name": fc.name, "result": result}
+            response_parts.append(
+                types.Part(function_response=types.FunctionResponse(name=fc.name, response=result))
+            )
+        contents.append(types.Content(role="user", parts=response_parts))
 
     yield {"type": "text", "content": "\n\n(Stopped: tool-call loop exceeded max rounds.)"}
     yield {"type": "done"}
-
-
-def _format_tool_result_content(result: dict) -> str:
-    """Compact JSON-like rendering so Claude consumes it cleanly as text."""
-    import json
-    try:
-        return json.dumps(result, ensure_ascii=False, default=str)
-    except Exception:
-        return str(result)
-
-
-def _extract_citations(content) -> list[dict]:
-    """Pull citation references out of web_search server_tool_use_result blocks."""
-    citations: list[dict] = []
-    for block in content:
-        # Web search tool results carry citation metadata on text blocks.
-        if block.type == "text":
-            for cit in getattr(block, "citations", []) or []:
-                cite_type = getattr(cit, "type", "")
-                if cite_type == "web_search_result_location":
-                    citations.append({
-                        "type": "web",
-                        "title": getattr(cit, "title", "") or "",
-                        "uri": getattr(cit, "url", "") or "",
-                    })
-    return citations

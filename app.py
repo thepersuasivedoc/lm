@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -21,8 +20,6 @@ def _check_api_keys() -> list[str]:
     missing: list[str] = []
     if not os.environ.get("GOOGLE_API_KEY"):
         missing.append("GOOGLE_API_KEY (Gemini)")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        missing.append("ANTHROPIC_API_KEY (Claude)")
     return missing
 
 
